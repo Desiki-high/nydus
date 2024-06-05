@@ -1,0 +1,120 @@
+name: Test
+
+on:
+  push:
+    branches: ["**", "stable/**"]
+    paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contrib-build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Golang
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.work'
+        cache-dependency-path: "**/*.sum"
+    - name: Build Contrib
+      run: |
+        make -e DOCKER=false GOARCH=${{ matrix.arch }} contrib-release
+    - name: Upload Nydusify
+      uses: actions/upload-artifact@v4
+      with:
+        name: nydusify-artifact
+        path: contrib/nydusify/cmd
+
+  nydus-build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: ${{ runner.os }}-cargo-${{ matrix.arch }}
+    - uses: dsherret/rust-toolchain-file@v1
+    - name: Build Nydus
+      run: |
+        RUST_TARGET="x86_64-unknown-linux-musl"
+        cargo install --locked --version 0.2.4 cross
+        make -e RUST_TARGET_STATIC=$RUST_TARGET -e CARGO=cross static-release
+        sudo mv target/$RUST_TARGET/release/nydusd .
+        sudo mv target/$RUST_TARGET/release/nydus-image .
+    - name: Upload Nydus Binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: nydus-artifact
+        path: |
+          nydus-image
+          nydusd
+
+  nydus-integration-test:
+    runs-on: ubuntu-latest
+    needs: [contrib-build, nydus-build]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Docker Cache
+      uses: jpribyl/action-docker-layer-caching@v0.1.0
+      continue-on-error: true
+    - name: Download Nydus
+      uses: actions/download-artifact@v4
+      with:
+        name: nydus-artifact
+        path: |
+          target/release
+    - name: Download Nydusify
+      uses: actions/download-artifact@v4
+      with:
+        name: nydusify-artifact
+        path: contrib/nydusify/cmd
+    - name: Prepare Older Binaries
+      id: prepare-binaries
+      run: |
+        export NYDUS_STABLE_VERSION=$(curl https://api.github.com/repos/Dragonflyoss/nydus/releases/latest | jq -r '.tag_name')
+
+        versions=(v0.1.0 ${NYDUS_STABLE_VERSION})
+        version_archs=(v0.1.0-x86_64 ${NYDUS_STABLE_VERSION}-linux-amd64)
+        for i in ${!versions[@]}; do
+          version=${versions[$i]}
+          version_arch=${version_archs[$i]}
+
+          wget -q https://github.com/dragonflyoss/nydus/releases/download/$version/nydus-static-$version_arch.tgz
+          sudo mkdir nydus-$version /usr/bin/nydus-$version
+          sudo tar xzf nydus-static-$version_arch.tgz -C nydus-$version
+          sudo cp -r nydus-$version/nydus-static/* /usr/bin/nydus-$version/
+        done
+    - name: Setup Golang
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.work'
+        cache-dependency-path: "**/*.sum"
+    - name: Integration Test
+      run: |
+        sudo mkdir -p /usr/bin/nydus-latest /home/runner/work/workdir
+        sudo install -D -m 755 contrib/nydusify/cmd/nydusify /usr/bin/nydus-latest
+        sudo install -D -m 755 target/release/nydusd target/release/nydus-image /usr/bin/nydus-latest
+        sudo bash misc/prepare.sh
+        
+        export NYDUS_STABLE_VERSION=$(curl https://api.github.com/repos/Dragonflyoss/nydus/releases/latest | jq -r '.tag_name')
+        export NYDUS_STABLE_VERSION_EXPORT="${NYDUS_STABLE_VERSION//./_}"
+
+        versions=(v0.1.0 ${NYDUS_STABLE_VERSION} latest)
+        version_exports=(v0_1_0 ${NYDUS_STABLE_VERSION_EXPORT} latest)
+        for i in ${!version_exports[@]}; do
+          version=${versions[$i]}
+          version_export=${version_exports[$i]}
+          export NYDUS_BUILDER_$version_export=/usr/bin/nydus-$version/nydus-image
+          export NYDUS_NYDUSD_$version_export=/usr/bin/nydus-$version/nydusd
+          export NYDUS_NYDUSIFY_$version_export=/usr/bin/nydus-$version/nydusify
+        done
+
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v1.54.2
+        sudo -E make smoke-only
